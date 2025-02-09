@@ -1,5 +1,5 @@
 # Model arguments
-model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+model_name_or_path: Qwen/QwQ-32B-Preview
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -9,7 +9,7 @@ dataset_name: eyad-silx/Quasar-RL
 dataset_configs:
 - all
 # Num processes is less by 1 as vLLM is using 1 GPU
-num_processes: 1
+num_processes: 7
 
 # GRPO trainer config
 bf16: true
