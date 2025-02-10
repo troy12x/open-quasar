@@ -1,5 +1,5 @@
 # Model arguments
-model_name_or_path: Qwen/QwQ-32B-Preview
+model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
