@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from peft import LoraConfig, get_peft_model
 
 import datasets
 import torch
@@ -84,8 +85,8 @@ class GRPOScriptArguments(ScriptArguments):
 SYSTEM_PROMPT = (
     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
     "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>"
+    "process and answer are enclosed within <|begin_of_thought|> <|end_of_thought|> and <|begin_of_solution|> <|end_of_solution|> > tags, respectively, i.e., "
+    "<|begin_of_thought|> reasoning process here <|end_of_thought|> <|begin_of_solution|> answer here <|end_of_solution|>"
 )
 
 
@@ -165,10 +166,23 @@ def main(script_args, training_args, model_args):
         trust_remote_code=model_args.trust_remote_code,
         attn_implementation=model_args.attn_implementation,
         torch_dtype=torch_dtype,
+        load_in_4bit=True, 
         use_cache=False if training_args.gradient_checkpointing else True,
     )
     training_args.model_init_kwargs = model_kwargs
 
+
+    peft_config = LoraConfig(
+    r=16,  # Choose any number > 0 ! Suggested 8, 16, 32, 64, 128
+    lora_alpha=16,
+    target_modules=[
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],  # Remove QKVO if out of memory
+    lora_dropout=0.1,
+    bias="none",
+    task_type="CAUSAL_LM",
+    )
     #############################
     # Initialize the GRPO trainer
     #############################
@@ -178,7 +192,7 @@ def main(script_args, training_args, model_args):
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        peft_config=get_peft_config(model_args),
+        peft_config=peft_config,
         callbacks=get_callbacks(training_args, model_args),
     )
 
