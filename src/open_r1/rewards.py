@@ -51,7 +51,7 @@ def accuracy_reward(completions, solution, **kwargs):
 
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<think>.*?</think>\s*<answer>.*?</answer>$"
+    pattern = r"<\|begin_of_thought\|>.*?<\|end_of_thought\|><\|begin_of_solution\|>.*?<\|end_of_solution\|>$"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
@@ -79,7 +79,7 @@ def get_cosine_scaled_reward(
     max_value_wrong: float = -0.5,
     min_value_correct: float = 0.5,
     max_value_correct: float = 1.0,
-    max_len: int = 1000,
+    max_len: int = 2050,
 ):
     def cosine_scaled_reward(completions, solution, **kwargs):
         """Reward function that scales based on completion length using a cosine schedule.
