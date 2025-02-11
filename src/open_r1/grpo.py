@@ -154,8 +154,8 @@ def main(script_args, training_args, model_args):
 
     dataset = dataset.map(make_conversation)
     for split in dataset:
-        if "answer" in dataset[split].column_names:
-            dataset[split] = dataset[split].remove_columns("answer")
+        if "messages" in dataset[split].column_names:
+            dataset[split] = dataset[split].remove_columns("messages")
 
     logger.info("*** Initializing model kwargs ***")
     torch_dtype = (
