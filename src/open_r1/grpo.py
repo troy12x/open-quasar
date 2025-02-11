@@ -77,7 +77,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Maximum reward for correct answers"},
     )
     cosine_max_len: int = field(
-        default=4000,
+        default=8129,
         metadata={"help": "Maximum length for scaling"},
     )
 
