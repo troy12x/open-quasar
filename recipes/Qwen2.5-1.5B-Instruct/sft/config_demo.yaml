@@ -1,5 +1,5 @@
 # Model arguments
-model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+model_name_or_path: eyad-silx/Quasar-2.0-7B
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -19,7 +19,7 @@ gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen2.5-1.5B-Open-R1-Distill
+hub_model_id: eyad-silx/Quasar-2.0-7B
 hub_strategy: every_save
 learning_rate: 2.0e-05
 log_level: info
