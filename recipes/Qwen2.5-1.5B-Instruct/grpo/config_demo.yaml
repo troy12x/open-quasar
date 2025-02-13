@@ -9,7 +9,7 @@ dataset_name: eyad-silx/Quasar-RL
 dataset_configs:
 - all
 # Num processes is less by 1 as vLLM is using 1 GPU
-num_processes: 7
+num_processes: 3
 
 # GRPO trainer config
 bf16: true
