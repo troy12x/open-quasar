@@ -8,7 +8,7 @@ attn_implementation: flash_attention_2
 dataset_name: HuggingFaceH4/Bespoke-Stratos-17k
 dataset_configs:
 - all
-preprocessing_num_workers: 8
+preprocessing_num_workers: 2
 
 # SFT trainer config
 bf16: true
