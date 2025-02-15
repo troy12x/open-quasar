@@ -1,14 +1,14 @@
 # Model arguments
-model_name_or_path: eyad-silx/Quasar-2.0-7B
+model_name_or_path: silx-ai/Quasar-2.0-7B-Pro
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
 
 # Data training arguments
-dataset_name: HuggingFaceH4/Bespoke-Stratos-17k
+dataset_name: eyad-silx/Quasar-Character-2.5
 dataset_configs:
 - all
-preprocessing_num_workers: 4
+preprocessing_num_workers: 2
 
 # SFT trainer config
 bf16: true
@@ -19,9 +19,9 @@ gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: eyad-silx/Quasar-2.0-7B-Thinking
+hub_model_id: eyad-silx/Quasar-2.5-7B-Ultra
 hub_strategy: every_save
-learning_rate: 2.0e-05
+learning_rate: 5.0e-05
 log_level: info
 logging_steps: 5
 logging_strategy: steps
