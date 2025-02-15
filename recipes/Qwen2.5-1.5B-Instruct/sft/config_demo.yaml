@@ -8,7 +8,7 @@ attn_implementation: flash_attention_2
 dataset_name: eyad-silx/Quasar-Character-2.5
 dataset_configs:
 - all
-preprocessing_num_workers: 2
+preprocessing_num_workers: 8
 
 # SFT trainer config
 bf16: true
