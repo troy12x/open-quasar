@@ -1,11 +1,11 @@
 # Model arguments
-model_name_or_path: silx-ai/Quasar-2.0-7B-Pro
+model_name_or_path: silx-ai/Quasar-2.5-7B-Ultra
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
 
 # Data training arguments
-dataset_name: eyad-silx/Quasar-Character-2.5
+dataset_name: eyad-silx/beka-2
 dataset_configs:
 - all
 preprocessing_num_workers: 8
@@ -19,7 +19,7 @@ gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: eyad-silx/Quasar-2.5-7B-Ultra
+hub_model_id: eyad-silx/Quasar-2.5-7B-Ultra-Code
 hub_strategy: every_save
 learning_rate: 5.0e-05
 log_level: info
@@ -29,7 +29,7 @@ lr_scheduler_type: cosine
 packing: true
 max_seq_length: 4096
 max_steps: -1
-num_train_epochs: 1
+num_train_epochs: 2
 output_dir: data/Qwen2.5-1.5B-Open-R1-Distill
 overwrite_output_dir: true
 packing: true
