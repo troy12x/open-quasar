@@ -1,5 +1,5 @@
 # Model arguments
-model_name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+model_name_or_path: silx-ai/Quasar-2.5-7B-Ultra
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -20,7 +20,7 @@ gradient_accumulation_steps: 4
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen2.5-1.5B-Open-R1-GRPO
+hub_model_id: silx-ai/Quasar-2.5-7B-Ultra-RL
 hub_strategy: every_save
 learning_rate: 2.0e-05
 log_completions: true
