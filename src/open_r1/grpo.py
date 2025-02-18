@@ -16,7 +16,6 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from peft import LoraConfig, get_peft_model
 
 import datasets
 import torch
@@ -26,8 +25,17 @@ from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from open_r1.configs import GRPOConfig
-from open_r1.rewards import accuracy_reward, format_reward, get_cosine_scaled_reward, reasoning_steps_reward
+from open_r1.rewards import (
+    accuracy_reward,
+    format_reward,
+    get_cosine_scaled_reward,
+    get_repetition_penalty_reward,
+    len_reward,
+    reasoning_steps_reward,
+)
+from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
+from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 
@@ -41,7 +49,7 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine'.
+            List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length'.
         cosine_min_value_wrong (`float`):
             Minimum reward for cosine scaling for wrong answers.
         cosine_max_value_wrong (`float`):
@@ -55,9 +63,9 @@ class GRPOScriptArguments(ScriptArguments):
     """
 
     reward_funcs: list[str] = field(
-        default_factory=lambda: ["accuracy", "format", "reasoning_steps", "cosine"],
+        default_factory=lambda: ["accuracy", "format"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'format_deepseek', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -80,14 +88,14 @@ class GRPOScriptArguments(ScriptArguments):
         default=8129,
         metadata={"help": "Maximum length for scaling"},
     )
-
-
-SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think> <answer> answer here </answer>."
-)
+    repetition_n_grams: int = field(
+        default=3,
+        metadata={"help": "Number of n-grams for repetition penalty reward"},
+    )
+    repetition_max_penalty: float = field(
+        default=-1.0,
+        metadata={"help": "Maximum (negative) penalty for for repetition penalty reward"},
+    )
 
 
 def main(script_args, training_args, model_args):
@@ -116,7 +124,7 @@ def main(script_args, training_args, model_args):
     )
     logger.info(f"Model parameters {model_args}")
     logger.info(f"Script parameters {script_args}")
-    logger.info(f"Data parameters {training_args}")
+    logger.info(f"Training parameters {training_args}")
 
     # Check for last checkpoint
     last_checkpoint = None
@@ -125,8 +133,16 @@ def main(script_args, training_args, model_args):
     if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
         logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
+    if "wandb" in training_args.report_to:
+        init_wandb_training(training_args)
+
     # Load the dataset
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+
+    ################
+    # Load tokenizer
+    ################
+    tokenizer = get_tokenizer(model_args, training_args)
 
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
@@ -140,19 +156,26 @@ def main(script_args, training_args, model_args):
             max_value_correct=script_args.cosine_max_value_correct,
             max_len=script_args.cosine_max_len,
         ),
+        "repetition_penalty": get_repetition_penalty_reward(
+            ngram_size=script_args.repetition_n_grams,
+            max_penalty=script_args.repetition_max_penalty,
+        ),
+        "length": len_reward,
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     # Format into conversation
     def make_conversation(example):
-        return {
-            "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": example["problem"]},
-            ],
-        }
+        prompt = []
+
+        if training_args.system_prompt is not None:
+            prompt.append({"role": "system", "content": training_args.system_prompt})
+
+        prompt.append({"role": "user", "content": example["problem"]})
+        return {"prompt": prompt}
 
     dataset = dataset.map(make_conversation)
+
     for split in dataset:
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
@@ -166,7 +189,6 @@ def main(script_args, training_args, model_args):
         trust_remote_code=model_args.trust_remote_code,
         attn_implementation=model_args.attn_implementation,
         torch_dtype=torch_dtype,
-        #load_in_4bit=True, 
         use_cache=False if training_args.gradient_checkpointing else True,
     )
     training_args.model_init_kwargs = model_kwargs
@@ -182,6 +204,7 @@ def main(script_args, training_args, model_args):
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
+        processing_class=tokenizer,
     )
 
     ###############
@@ -194,7 +217,7 @@ def main(script_args, training_args, model_args):
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
-    metrics = train_result.metricsf
+    metrics = train_result.metrics
     metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
@@ -217,8 +240,6 @@ def main(script_args, training_args, model_args):
         # Restore k,v cache for fast inference
         trainer.model.config.use_cache = True
         trainer.model.config.save_pretrained(training_args.output_dir)
-        trainer.save_lora("grpo_saved_lora")
-
 
     ##########
     # Evaluate
