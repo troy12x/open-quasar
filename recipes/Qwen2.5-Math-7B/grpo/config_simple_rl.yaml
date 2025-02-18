@@ -1,5 +1,5 @@
 # Model arguments
-model_name_or_path: Qwen/Qwen2.5-Math-7B
+model_name_or_path: silx-ai/Quasar-2.5-7B-Ultra
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -8,8 +8,7 @@ attn_implementation: flash_attention_2
 dataset_name: DigitalLearningGmbH/MATH-lighteval
 dataset_configs:
 - train
-# Num processes is less by 1 as vLLM is using 1 GPU
-num_processes: 7
+system_prompt: "You are Quasar-1, an advanced creation by SILX AI. You are a helpful AI Assistant that provides well-reasoned and detailed responses involves thoroughly exploring questions through a systematic long thinking process before providing the final precise . to reach the conclusion, formatted as follows:  <|begin_of_thought|>{Your detailed thinking process here}<|end_of_thought|> <|begin_of_solution|> {final formatted, precise, and clear solution} <|end_of_solution|>"
 
 # GRPO trainer config
 bf16: true
@@ -18,30 +17,38 @@ vllm_device: auto
 vllm_gpu_memory_utilization: 0.7
 do_eval: true
 eval_strategy: steps
-eval_steps: 100
+eval_steps: 3000
 gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen-2.5-7B-Simple-RL
+hub_model_id: silx-ai/Quasar-2.5-7B-Ultra-RL
 hub_strategy: every_save
 learning_rate: 3.0e-06
+log_completions: true
 log_level: info
+logging_first_step: true
 logging_steps: 5
 logging_strategy: steps
 lr_scheduler_type: cosine
 max_prompt_length: 512
-max_completion_length: 1024
+max_completion_length: 8129
 max_steps: -1
-num_generations: 7
+num_generations: 2
 num_train_epochs: 1
 output_dir: data/Qwen-2.5-7B-Simple-RL
 overwrite_output_dir: true
 per_device_eval_batch_size: 2
-per_device_train_batch_size: 2
+per_device_train_batch_size: 16
 push_to_hub: true
 report_to:
 - wandb
+reward_funcs:
+- accuracy
+- format
+reward_weights:
+- 1.0
+- 1.0
 save_strategy: "no"
 seed: 42
 warmup_ratio: 0.1
