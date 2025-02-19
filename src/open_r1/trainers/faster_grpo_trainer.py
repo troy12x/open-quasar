@@ -1,8 +1,23 @@
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from multiprocessing import reduction
 import time
 from transformers import Trainer
 import trl
+from unittest.mock import patch
+
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Union
 from datasets import Dataset
@@ -225,16 +240,20 @@ class FastGRPOTrainer(Trainer):
 
         # offload model to cpu, TODO: offload optimizer
         self.model = self.model.to("cpu")
-        
-        self.gen_vllm = LLM(
-                model=model.name_or_path,
-                device=self.accelerator.device,
-                gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                dtype=self.args.vllm_dtype,
-                enable_prefix_caching=True,
-                max_model_len=self.args.vllm_max_model_len,
-                enable_sleep_mode=True,
-            )
+        world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+        profiling_patch = patch(
+            "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
+        )
+        with world_size_patch, profiling_patch:
+            self.gen_vllm = LLM(
+                    model=model.name_or_path,
+                    device=self.accelerator.device,
+                    gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                    dtype=self.args.vllm_dtype,
+                    enable_prefix_caching=True,
+                    max_model_len=self.args.vllm_max_model_len,
+                    enable_sleep_mode=True,
+                )
         self.sampling_params = SamplingParams(
             temperature=args.temperature,
             max_tokens=self.args.max_completion_length,
