@@ -277,10 +277,8 @@ class FastGRPOTrainer(Trainer):
         
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
         # add cuda clear cache here and a sleep
-        torch.cuda.empty_cache()
-        time.sleep(1.0)
-        self.gen_vllm.wake_up()
-        all_outputs = self.gen_vllm.generate(prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+
+        all_outputs = self.gen_vllm.generate(prompts_text, sampling_params=self.sampling_params, use_tqdm=True)
         
         #offload vllm instance
         self.gen_vllm.sleep()
@@ -343,6 +341,12 @@ class FastGRPOTrainer(Trainer):
                     state[k] = v.to(device)
         return optimizer
 
+    def _sync_weights_to_vllm(self):
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        state_dict =  unwrapped_model.state_dict()
+        gen_model = self.gen_vllm.llm_engine.model_executor.driver_worker.model_runner.model
+        gen_model.load_weights(state_dict.items())   
+
     def train(self,         
             resume_from_checkpoint: Optional[Union[str, bool]] = None,
         ):
@@ -375,8 +379,15 @@ class FastGRPOTrainer(Trainer):
             batch = next(iter_dataloader)
             
             self.ref_model = self.ref_model.to("cpu")
-            self.model = self.model.to("cpu")
             self.optimizer = self._move_optimizer_to_device(self.optimizer, "cpu")
+            
+            # sync latest weights, requires both model and vllm instance to be on the same device
+            torch.cuda.empty_cache()
+            time.sleep(1.0)
+            self.gen_vllm.wake_up()
+            self._sync_weights_to_vllm()
+            
+            self.model = self.model.to("cpu")
             
             batch = self.prepare_batch(batch)
             # TODO: log completions, rewards, etc
@@ -405,8 +416,8 @@ class FastGRPOTrainer(Trainer):
                     "advantages": advantages.to(device), 
                 }
 
-            
-            gen_dataloader = DataLoader(
+            # we could add some optimizations here like sorting the dataset by length to improve throughput, but we will keep it simple for now
+            mini_batch_dataloader = DataLoader(
                 gen_dataset,
                 batch_size=self.args.per_device_train_batch_size,
                 shuffle=True, # we technically don#t need to shuffle due to grad acc, but we may move to clipped loss later
@@ -421,7 +432,7 @@ class FastGRPOTrainer(Trainer):
             self.model = self.model.to(device)
             self.optimizer = self._move_optimizer_to_device(self.optimizer, device)
             
-            for mini_batch in gen_dataloader:
+            for mini_batch in mini_batch_dataloader:
                 prompt_completion_ids = mini_batch["prompt_completion_ids"]
                 attention_mask = mini_batch["attention_mask"][:, 1:] #  TODO, fix padding with the optimization from the original grpo trainer
                 logits_to_keep = prompt_completion_ids.size(1) - 1 # TODO, fix padding with the optimization from the original grpo trainer
@@ -448,7 +459,7 @@ class FastGRPOTrainer(Trainer):
 
             # TODO: weight sync
 
-            
+
             # logging stats
             metrics = {}
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
