@@ -241,10 +241,13 @@ class FastGRPOTrainer(Trainer):
         # offload model to cpu, TODO: offload optimizer
         self.model = self.model.to("cpu")
         world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-        profiling_patch = patch(
-            "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
-        )
-        with world_size_patch, profiling_patch:
+        rank_patch = patch("torch.distributed.get_rank", return_value=0)
+        get_backend_patch = patch("torch.distributed.get_backend", return_value=None)
+        
+        # profiling_patch = patch(
+        #     "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
+        # )
+        with world_size_patch, rank_patch, get_backend_patch:
             self.gen_vllm = LLM(
                     model=model.name_or_path,
                     device=self.accelerator.device,
@@ -300,7 +303,6 @@ class FastGRPOTrainer(Trainer):
         all_outputs = self.gen_vllm.generate(prompts_text, sampling_params=self.sampling_params, use_tqdm=True)
         
         #offload vllm instance
-        self.gen_vllm.sleep()
         completion_ids = []
         for outputs in all_outputs:
             for output in outputs.outputs:
@@ -394,6 +396,30 @@ class FastGRPOTrainer(Trainer):
         iter_dataloader = iter(repeat_generator())
         
         self.model.train()
+        
+        @torch.no_grad()
+        def mini_batch_collator(examples):
+            device = self.accelerator.device
+            
+            prompt_ids = [example["prompt_ids"] for example in examples]
+            completion_ids = [example["completion_ids"] for example in examples]
+            
+            if self.args.max_prompt_length is not None:
+                prompt_ids = [p[-self.args.max_prompt_length :] for p in prompt_ids]
+            
+            pad_token_id = self.processing_class.pad_token_id
+            prompt_completion_ids = [torch.LongTensor(p+c) for p,c in zip(prompt_ids, completion_ids)]
+            prompt_completion_ids = pad(prompt_completion_ids, padding_value=pad_token_id)
+            attention_mask = (prompt_completion_ids != pad_token_id).long() # TODO, this does not work as expected when pad_id == eos_id
+        
+            advantages = torch.Tensor([example["advantages"] for example in examples])
+            
+            return {
+                "prompt_completion_ids": prompt_completion_ids.to(device),
+                "attention_mask": attention_mask.to(device),
+                "advantages": advantages.to(device), 
+            }
+        
         for step in range(start_step, self.total_steps_per_device + 1):
             batch = next(iter_dataloader)
             
@@ -409,32 +435,10 @@ class FastGRPOTrainer(Trainer):
             self.model = self.model.to("cpu")
             
             batch = self.prepare_batch(batch)
+            self.gen_vllm.sleep()
             # TODO: log completions, rewards, etc
             gen_dataset = Dataset.from_list(batch)
             
-            @torch.no_grad()
-            def mini_batch_collator(examples):
-                device = self.accelerator.device
-                
-                prompt_ids = [example["prompt_ids"] for example in examples]
-                completion_ids = [example["completion_ids"] for example in examples]
-                
-                if self.args.max_prompt_length is not None:
-                    prompt_ids = [p[-self.args.max_prompt_length :] for p in prompt_ids]
-                
-                pad_token_id = self.processing_class.pad_token_id
-                prompt_completion_ids = [torch.LongTensor(p+c) for p,c in zip(prompt_ids, completion_ids)]
-                prompt_completion_ids = pad(prompt_completion_ids, padding_value=pad_token_id)
-                attention_mask = (prompt_completion_ids != pad_token_id).long() # TODO, this does not work as expected when pad_id == eos_id
-            
-                advantages = torch.Tensor([example["advantages"] for example in examples])
-                
-                return {
-                    "prompt_completion_ids": prompt_completion_ids.to(device),
-                    "attention_mask": attention_mask.to(device),
-                    "advantages": advantages.to(device), 
-                }
-
             # we could add some optimizations here like sorting the dataset by length to improve throughput, but we will keep it simple for now
             mini_batch_dataloader = DataLoader(
                 gen_dataset,
@@ -447,7 +451,7 @@ class FastGRPOTrainer(Trainer):
             # stats for logging
             losses = []
             device = self.accelerator.device
-            self.ref_model = self.ref_model.to(device)
+            
             self.model = self.model.to(device)
             self.optimizer = self._move_optimizer_to_device(self.optimizer, device)
             
@@ -457,10 +461,13 @@ class FastGRPOTrainer(Trainer):
                 logits_to_keep = prompt_completion_ids.size(1) - 1 # TODO, fix padding with the optimization from the original grpo trainer
                 
                 # get the ref logprobs, this could also be done at the batch prepare step to avoid too much model unloading
+                self.ref_model = self.ref_model.to(device)
                 with torch.inference_mode():
                     ref_per_token_logps = self._get_per_token_logps(
                         self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                     )   
+                self.ref_model = self.ref_model.to("cpu")
+                torch.cuda.empty_cache()
                 
                 with self.accelerator.accumulate(self.model):
                     per_token_logps = self._get_per_token_logps(self.model, prompt_completion_ids, attention_mask, logits_to_keep)
