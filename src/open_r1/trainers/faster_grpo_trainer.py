@@ -435,7 +435,12 @@ class FastGRPOTrainer(Trainer):
             self.model = self.model.to("cpu")
             
             batch = self.prepare_batch(batch)
+            torch.cuda.empty_cache()
+            # time.sleep(1.0)
+            self.accelerator.wait_for_everyone()
             self.gen_vllm.sleep()
+            torch.cuda.empty_cache()
+            time.sleep(1.0)
             # TODO: log completions, rewards, etc
             gen_dataset = Dataset.from_list(batch)
             
@@ -451,14 +456,16 @@ class FastGRPOTrainer(Trainer):
             # stats for logging
             losses = []
             device = self.accelerator.device
+
+             # fix because of interence on vllm.sleep() ?
             
             self.model = self.model.to(device)
             self.optimizer = self._move_optimizer_to_device(self.optimizer, device)
-            
             for mini_batch in mini_batch_dataloader:
                 prompt_completion_ids = mini_batch["prompt_completion_ids"]
                 attention_mask = mini_batch["attention_mask"][:, 1:] #  TODO, fix padding with the optimization from the original grpo trainer
                 logits_to_keep = prompt_completion_ids.size(1) - 1 # TODO, fix padding with the optimization from the original grpo trainer
+                torch.cuda.empty_cache()
                 
                 # get the ref logprobs, this could also be done at the batch prepare step to avoid too much model unloading
                 self.ref_model = self.ref_model.to(device)
