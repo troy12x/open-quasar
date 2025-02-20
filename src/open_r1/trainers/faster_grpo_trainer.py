@@ -25,6 +25,7 @@ from typing import Callable, Optional, Union
 from datasets import Dataset
 from torch.utils.data import DataLoader
 import torch
+from accelerate.utils import gather_object
 from transformers import (
     DataCollatorWithPadding,
     PreTrainedTokenizerBase,
@@ -51,7 +52,8 @@ from transformers import (
     is_wandb_available,
 )
 import gc
-
+from open_r1.trainers.remote_model import RemoteModel
+import tempfile
 from trl.trainer.utils import pad, selective_log_softmax
 from transformers import (
     AutoModelForCausalLM,
@@ -69,6 +71,64 @@ from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 from vllm import LLM, SamplingParams
+
+import functools
+import time
+
+from transformers import is_wandb_available
+
+
+if is_wandb_available():
+    import wandb
+
+
+# def profiling_decorator(func):
+#     """
+#     Decorator to profile a function and log the time taken to execute it.
+#     """
+
+#     @functools.wraps(func)
+#     def wrapper(self, *args, **kwargs):
+#         start_time = time.perf_counter()
+#         result = func(self, *args, **kwargs)
+#         end_time = time.perf_counter()
+#         duration = end_time - start_time
+
+#         if "wandb" in self.args.report_to and wandb.run is not None and self.accelerator.is_main_process:
+#             wandb.log({f"profiling/Time taken: {self.__class__.__name__}.{func.__name__}": duration})
+#         return result
+
+#     return wrapper
+import time
+import contextlib
+import functools
+import wandb
+
+@contextlib.contextmanager
+def profiling_context(instance, name):
+    """
+    A context manager function for profiling a block of code.
+    Can also be used as a decorator.
+    """
+    start_time = time.perf_counter()
+    yield
+    end_time = time.perf_counter()
+    duration = end_time - start_time
+
+    if "wandb" in instance.args.report_to and wandb.run is not None and instance.accelerator.is_main_process:
+        wandb.log({f"profiling/Time taken: {instance.__class__.__name__}.{name}": duration})
+
+def profiling_decorator(func):
+    """
+    Decorator to profile a function and log execution time using profiling_context.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with profiling_context(self, func.__name__):
+            return func(self, *args, **kwargs)
+
+    return wrapper
 
 from accelerate import Accelerator
 if is_wandb_available():
@@ -108,6 +168,12 @@ class FastGRPOConfig(trl.GRPOConfig):
     wandb_project: Optional[str] = field(
         default=None,
         metadata={"help": ("The project to store runs under.")},
+    )
+    remote_gen_model_url: str = field(
+        default="26.0.164.45", 
+    )
+    remote_gen_model_port: str = field(
+        default="30010",
     )
 
 
@@ -242,36 +308,9 @@ class FastGRPOTrainer(Trainer):
         torch.manual_seed(args.seed)
         self.model, self.optimizer, self.dataloader = self.accelerator.prepare(self.model, self.optimizer, self.dataloader)
         device = self.accelerator.device
-        # offload model to cpu, offload optimizer
-        self.accelerator.unwrap_model(self.model).to("cpu")
-        self.optimizer = self._move_optimizer_to_device(self.optimizer, "cpu")
-        gc.collect()
-        torch.cuda.empty_cache()
-        time.sleep(1.0)
-        world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-        rank_patch = patch("torch.distributed.get_rank", return_value=0)
-        get_backend_patch = patch("torch.distributed.get_backend", return_value=None)
-        
-        # profiling_patch = patch(
-        #     "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
-        # )
-        # with world_size_patch, rank_patch, get_backend_patch:
-        self.gen_vllm = LLM(
-                model=model.name_or_path,
-                device=self.accelerator.device,
-                gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                dtype=self.args.vllm_dtype,
-                enable_prefix_caching=True,
-                max_model_len=self.args.vllm_max_model_len,
-                enable_sleep_mode=True,
-                # distributed_executor_backend="external_launcher",
-                pipeline_parallel_size=8,
-            )
-        self.sampling_params = SamplingParams(
-            temperature=args.temperature,
-            max_tokens=self.args.max_completion_length,
-            n=args.num_generations,
-        )
+
+        # connect to a remote sglang model
+        self.remote_model = RemoteModel(args.remote_gen_model_url, args.remote_gen_model_port, self.processing_class.eos_token_id)
 
     def print_gpu_memory_usage(self):
         if torch.cuda.is_available():
@@ -283,6 +322,7 @@ class FastGRPOTrainer(Trainer):
             print("CUDA is not available.")
 
     # Get the per-token log probabilities for the completions for the model and the reference model
+    @profiling_decorator
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
         # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
         logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
@@ -295,11 +335,11 @@ class FastGRPOTrainer(Trainer):
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
     
     @torch.no_grad()
-    def prepare_batch(self, batch):
+    @profiling_decorator
+    def _prepare_batch(self, batch):
         """
         This will:
         - generate k samples for each problem
-        - compute ref logprobs for each generation
         - using internal reward model(s) to get rewards
         """
         device = self.accelerator.device
@@ -310,13 +350,18 @@ class FastGRPOTrainer(Trainer):
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
         # add cuda clear cache here and a sleep
 
-        all_outputs = self.gen_vllm.generate(prompts_text, sampling_params=self.sampling_params, use_tqdm=True)
+
+        all_outputs = self.remote_model.generate(prompt_ids, max_new_tokens=self.args.max_completion_length, temperature=self.args.temperature, num_generations=self.args.num_generations)
         
-        #offload vllm instance
-        completion_ids = []
-        for outputs in all_outputs:
-            for output in outputs.outputs:
-                completion_ids.append(output.token_ids)
+        # all_outputs = self.gen_vllm.generate(prompts_text, sampling_params=self.sampling_params, use_tqdm=True)
+        
+        completion_ids = [example["completion_ids"] for example in all_outputs]
+        
+        
+        # completion_ids = []
+        # for outputs in all_outputs:
+        #     for output in outputs.outputs:
+        #         completion_ids.append(output.token_ids)
                
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -324,6 +369,10 @@ class FastGRPOTrainer(Trainer):
         repeated_prompts = []
         for prompt in prompts:
             repeated_prompts.extend([prompt]*self.args.num_generations)
+        
+        repeated_prompt_texts = []
+        for prompt in prompts_text:
+            repeated_prompt_texts.extend([prompt]*self.args.num_generations)
         
         if is_conversational(batch[0]):
             completions = []
@@ -352,40 +401,31 @@ class FastGRPOTrainer(Trainer):
         
         # build batch as list of dicts
         examples = []
-        for i, prompt in enumerate(repeated_prompts):
+        for i, prompt in enumerate(repeated_prompt_texts):
             example = {
                 "prompt": prompt,
                 "prompt_ids": prompt_ids[i // self.args.num_generations],
                 "completion": completions_text[i],
                 "completion_ids": completion_ids[i],
                 "advantages": advantages[i], 
-                "rewards": rewards[i]
+                "rewards": rewards[i],
             }
             examples.append(example)
         
-        return examples
-
-    def _move_optimizer_to_device(self, optimizer, device):
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
-        return optimizer
-
-    def print_gpu_mem(self):
-        for obj in gc.get_objects():
-            try:
-                if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
-                    if obj.device != "cpu":
-                        print(type(obj), obj.size(), obj.device)
-            except: pass
-            
-    def _sync_weights_to_vllm(self):
-        unwrapped_model = self.accelerator.unwrap_model(self.model)
-        state_dict =  unwrapped_model.state_dict()
-        gen_model = self.gen_vllm.llm_engine.model_executor.driver_worker.model_runner.model
-        gen_model.load_weights(state_dict.items())   
-
+        return examples 
+    
+    @profiling_decorator
+    def _sync_weights(self):
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            start = time.time()
+            with tempfile.TemporaryDirectory(dir="/fsx/edward/work/open-r1/data/") as temp_dir_path:
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                unwrapped_model.save_pretrained(temp_dir_path)
+                self.remote_model.load_weights_from_path(temp_dir_path)
+            print("weight sync took: ", time.time() - start)
+        self.accelerator.wait_for_everyone()
+        
     def train(self,         
             resume_from_checkpoint: Optional[Union[str, bool]] = None,
         ):
@@ -428,7 +468,16 @@ class FastGRPOTrainer(Trainer):
             pad_token_id = self.processing_class.pad_token_id
             prompt_completion_ids = [torch.LongTensor(p+c) for p,c in zip(prompt_ids, completion_ids)]
             prompt_completion_ids = pad(prompt_completion_ids, padding_value=pad_token_id)
-            attention_mask = (prompt_completion_ids != pad_token_id).long() # TODO, this does not work as expected when pad_id == eos_id
+            # attention_mask = (prompt_completion_ids != pad_token_id).long() # TODO, this does not work as expected when pad_id == eos_id
+        
+        
+            # Mask everything after the first EOS token (taken from GRPOTrainer)
+            is_eos = prompt_completion_ids == self.processing_class.eos_token_id
+            eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
+            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+            sequence_indices = torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1)
+            attention_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        
         
             advantages = torch.Tensor([example["advantages"] for example in examples])
             
@@ -442,27 +491,9 @@ class FastGRPOTrainer(Trainer):
             batch = next(iter_dataloader)
             
             self.ref_model = self.ref_model.to("cpu")
-            self.optimizer = self._move_optimizer_to_device(self.optimizer, "cpu")
-            
-            # sync latest weights, requires both model and vllm instance to be on the same device
-            # gc.collect()
-            # torch.cuda.empty_cache()
-            # time.sleep(1.0)
-            self.gen_vllm.wake_up()
-            self._sync_weights_to_vllm()
-            
-            self.accelerator.unwrap_model(self.model).to("cpu")
-            
-            batch = self.prepare_batch(batch)
-            # gc.collect()
-            # torch.cuda.empty_cache()
-            # time.sleep(1.0)
-            self.accelerator.wait_for_everyone()
-            self.gen_vllm.sleep()
-            self.accelerator.wait_for_everyone()
-            gc.collect()
-            torch.cuda.empty_cache()
-            time.sleep(1.0)
+           
+            batch = self._prepare_batch(batch)
+
             # TODO: log completions, rewards, etc
             gen_dataset = Dataset.from_list(batch)
             # we could add some optimizations here like sorting the dataset by length to improve throughput, but we will keep it simple for now
@@ -476,52 +507,94 @@ class FastGRPOTrainer(Trainer):
             # optimization
             # stats for logging
             losses = []
-
+            kls = []
+            
+            with profiling_context(self, "train_step"):
             # at this point there should be no tensors in GPU memory
-            self.accelerator.unwrap_model(self.model).to(device)
-            self.optimizer = self._move_optimizer_to_device(self.optimizer, device)
-            for mini_batch in mini_batch_dataloader:
-                prompt_completion_ids = mini_batch["prompt_completion_ids"]
-                attention_mask = mini_batch["attention_mask"][:, 1:] #  TODO, fix padding with the optimization from the original grpo trainer
-                logits_to_keep = prompt_completion_ids.size(1) - 1 # TODO, fix padding with the optimization from the original grpo trainer
-                # torch.cuda.empty_cache()
-                
-                # get the ref logprobs, this could also be done at the batch prepare step to avoid too much model unloading
-                self.ref_model = self.ref_model.to(device)
-                with torch.inference_mode():
-                    ref_per_token_logps = self._get_per_token_logps(
-                        self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-                    )   
-                self.ref_model = self.ref_model.to("cpu")
-                # torch.cuda.empty_cache()
-                
-                with self.accelerator.accumulate(self.model):
-                    per_token_logps = self._get_per_token_logps(self.model, prompt_completion_ids, attention_mask, logits_to_keep)
-                    per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+                for mini_batch in mini_batch_dataloader:
+                    prompt_completion_ids = mini_batch["prompt_completion_ids"]
+                    attention_mask = mini_batch["attention_mask"][:, 1:] #  TODO, fix padding with the optimization from the original grpo trainer
+                    logits_to_keep = prompt_completion_ids.size(1) - 1 # TODO, fix padding with the optimization from the original grpo trainer
+                    # torch.cuda.empty_cache()
                     
-                    advantages = mini_batch["advantages"]
-                    per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-                    per_token_loss = per_token_loss + self.args.beta * per_token_kl
-                    loss = (per_token_loss * attention_mask).sum() / attention_mask.sum()
+                    # get the ref logprobs, this could also be done at the batch prepare step to avoid too much model unloading
+                    self.ref_model = self.ref_model.to(device)
+                    with torch.inference_mode():
+                        ref_per_token_logps = self._get_per_token_logps(
+                            self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                        )   
+                    self.ref_model = self.ref_model.to("cpu")
+                    # torch.cuda.empty_cache()
                     
-                    losses.append(loss.item())
-                    self.accelerator.backward(loss)
-                    self.optimizer.step()
-                    self.optimizer.zero_grad()
+                    with self.accelerator.accumulate(self.model):
+                        per_token_logps = self._get_per_token_logps(self.model, prompt_completion_ids, attention_mask, logits_to_keep)
+                        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+                        
+                        advantages = mini_batch["advantages"]
+                        per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+                        per_token_loss = per_token_loss + self.args.beta * per_token_kl
+                        loss = (per_token_loss * attention_mask).sum() / attention_mask.sum()
+                        
+                        self.accelerator.backward(loss)
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+                        losses.append(loss.detach().item())
+                        kls.append(per_token_kl.mean().item())
 
-            # TODO: weight sync
-
-
+            
+                    del per_token_logps, per_token_kl, per_token_loss, loss
+                    torch.cuda.empty_cache()
+                
+            
+            self.lr_scheduler.step()
+            self.state.global_step += 1
+            self.state.epoch = step / self.total_steps_per_device #  TODO, this is not correct
+                
             # logging stats
             metrics = {}
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
             metrics["loss"] = self.accelerator.gather_for_metrics(torch.Tensor(losses).to(device)).mean().item()
-            self.state.epoch = step / self.total_steps_per_device
+            metrics["kl"] = self.accelerator.gather_for_metrics(torch.Tensor(kls).to(device)).mean().item()
+            
+            # completions stats
+            completion_lengths = [len(c) for c in gen_dataset["completion_ids"]]
+            gathered_completion_lengths = self.accelerator.gather_for_metrics(torch.Tensor(completion_lengths).to(device))
+            metrics["mean_completion_lengths"] = gathered_completion_lengths.mean().item()
+            metrics["max_completion_lengths"] = gathered_completion_lengths.max().item()
+            metrics["min_completion_lengths"] = gathered_completion_lengths.min().item()
+            
+            # reward stats
+            rewards = gen_dataset["rewards"]
+            gathered_rewards = self.accelerator.gather_for_metrics(torch.Tensor(rewards).to(device))
+            reward_per_func = gathered_rewards.mean(0)
+            for i, reward_func in enumerate(self.reward_funcs):
+                reward_func_name = reward_func.__name__
+                metrics[f"rewards/{reward_func_name}"] = reward_per_func[i].item()
+                
+            metrics["reward"] = reward_per_func.sum().item()    
+            
+                
             self.log(metrics)
+            if self.args.log_completions and "wandb" in self.args.report_to:
+                import pandas as pd
+                prompts = gather_object(gen_dataset["prompt"])
+                completions = gather_object(gen_dataset["completion"])
+                # For logging
+                table = {
+                    "step": [str(self.state.global_step)] * len(prompts),
+                    "prompts": prompts,
+                    "completion": completions,
+                    "reward": gathered_rewards.sum(1).tolist(),
+                }
+                df = pd.DataFrame(table)
+
+                if wandb.run is not None and self.accelerator.is_main_process:
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+
             
-            
-            self.lr_scheduler.step()
-            self.state.global_step += 1
+            # sync weights to remote server
+            self._sync_weights()
+
             
             self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
             if self.control.should_save:
