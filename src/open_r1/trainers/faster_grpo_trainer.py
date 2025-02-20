@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# great reference: https://github.com/vllm-project/vllm/issues/11400
+
 from multiprocessing import reduction
 import time
 from transformers import Trainer
@@ -48,6 +50,8 @@ from transformers import (
     TrainerControl,
     is_wandb_available,
 )
+import gc
+
 from trl.trainer.utils import pad, selective_log_softmax
 from transformers import (
     AutoModelForCausalLM,
@@ -237,9 +241,13 @@ class FastGRPOTrainer(Trainer):
         )
         torch.manual_seed(args.seed)
         self.model, self.optimizer, self.dataloader = self.accelerator.prepare(self.model, self.optimizer, self.dataloader)
-
-        # offload model to cpu, TODO: offload optimizer
-        self.model = self.model.to("cpu")
+        device = self.accelerator.device
+        # offload model to cpu, offload optimizer
+        self.accelerator.unwrap_model(self.model).to("cpu")
+        self.optimizer = self._move_optimizer_to_device(self.optimizer, "cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        time.sleep(1.0)
         world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
         rank_patch = patch("torch.distributed.get_rank", return_value=0)
         get_backend_patch = patch("torch.distributed.get_backend", return_value=None)
@@ -247,16 +255,18 @@ class FastGRPOTrainer(Trainer):
         # profiling_patch = patch(
         #     "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
         # )
-        with world_size_patch, rank_patch, get_backend_patch:
-            self.gen_vllm = LLM(
-                    model=model.name_or_path,
-                    device=self.accelerator.device,
-                    gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
-                    dtype=self.args.vllm_dtype,
-                    enable_prefix_caching=True,
-                    max_model_len=self.args.vllm_max_model_len,
-                    enable_sleep_mode=True,
-                )
+        # with world_size_patch, rank_patch, get_backend_patch:
+        self.gen_vllm = LLM(
+                model=model.name_or_path,
+                device=self.accelerator.device,
+                gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                dtype=self.args.vllm_dtype,
+                enable_prefix_caching=True,
+                max_model_len=self.args.vllm_max_model_len,
+                enable_sleep_mode=True,
+                # distributed_executor_backend="external_launcher",
+                pipeline_parallel_size=8,
+            )
         self.sampling_params = SamplingParams(
             temperature=args.temperature,
             max_tokens=self.args.max_completion_length,
@@ -362,6 +372,14 @@ class FastGRPOTrainer(Trainer):
                     state[k] = v.to(device)
         return optimizer
 
+    def print_gpu_mem(self):
+        for obj in gc.get_objects():
+            try:
+                if torch.is_tensor(obj) or (hasattr(obj, 'data') and torch.is_tensor(obj.data)):
+                    if obj.device != "cpu":
+                        print(type(obj), obj.size(), obj.device)
+            except: pass
+            
     def _sync_weights_to_vllm(self):
         unwrapped_model = self.accelerator.unwrap_model(self.model)
         state_dict =  unwrapped_model.state_dict()
@@ -419,7 +437,7 @@ class FastGRPOTrainer(Trainer):
                 "attention_mask": attention_mask.to(device),
                 "advantages": advantages.to(device), 
             }
-        
+        device = self.accelerator.device
         for step in range(start_step, self.total_steps_per_device + 1):
             batch = next(iter_dataloader)
             
@@ -427,23 +445,26 @@ class FastGRPOTrainer(Trainer):
             self.optimizer = self._move_optimizer_to_device(self.optimizer, "cpu")
             
             # sync latest weights, requires both model and vllm instance to be on the same device
-            torch.cuda.empty_cache()
-            time.sleep(1.0)
+            # gc.collect()
+            # torch.cuda.empty_cache()
+            # time.sleep(1.0)
             self.gen_vllm.wake_up()
             self._sync_weights_to_vllm()
             
-            self.model = self.model.to("cpu")
+            self.accelerator.unwrap_model(self.model).to("cpu")
             
             batch = self.prepare_batch(batch)
-            torch.cuda.empty_cache()
+            # gc.collect()
+            # torch.cuda.empty_cache()
             # time.sleep(1.0)
             self.accelerator.wait_for_everyone()
             self.gen_vllm.sleep()
+            self.accelerator.wait_for_everyone()
+            gc.collect()
             torch.cuda.empty_cache()
             time.sleep(1.0)
             # TODO: log completions, rewards, etc
             gen_dataset = Dataset.from_list(batch)
-            
             # we could add some optimizations here like sorting the dataset by length to improve throughput, but we will keep it simple for now
             mini_batch_dataloader = DataLoader(
                 gen_dataset,
@@ -455,17 +476,15 @@ class FastGRPOTrainer(Trainer):
             # optimization
             # stats for logging
             losses = []
-            device = self.accelerator.device
 
-             # fix because of interence on vllm.sleep() ?
-            
-            self.model = self.model.to(device)
+            # at this point there should be no tensors in GPU memory
+            self.accelerator.unwrap_model(self.model).to(device)
             self.optimizer = self._move_optimizer_to_device(self.optimizer, device)
             for mini_batch in mini_batch_dataloader:
                 prompt_completion_ids = mini_batch["prompt_completion_ids"]
                 attention_mask = mini_batch["attention_mask"][:, 1:] #  TODO, fix padding with the optimization from the original grpo trainer
                 logits_to_keep = prompt_completion_ids.size(1) - 1 # TODO, fix padding with the optimization from the original grpo trainer
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache()
                 
                 # get the ref logprobs, this could also be done at the batch prepare step to avoid too much model unloading
                 self.ref_model = self.ref_model.to(device)
@@ -474,7 +493,7 @@ class FastGRPOTrainer(Trainer):
                         self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                     )   
                 self.ref_model = self.ref_model.to("cpu")
-                torch.cuda.empty_cache()
+                # torch.cuda.empty_cache()
                 
                 with self.accelerator.accumulate(self.model):
                     per_token_logps = self._get_per_token_logps(self.model, prompt_completion_ids, attention_mask, logits_to_keep)
