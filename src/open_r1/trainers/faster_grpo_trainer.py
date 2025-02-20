@@ -14,95 +14,60 @@
 
 # great reference: https://github.com/vllm-project/vllm/issues/11400
 
-from multiprocessing import reduction
-import time
-from transformers import Trainer
-import trl
-from unittest.mock import patch
-
-from dataclasses import dataclass, field
-from typing import Callable, Optional, Union
-from datasets import Dataset
-from torch.utils.data import DataLoader
-import torch
-from accelerate.utils import gather_object
-from transformers import (
-    DataCollatorWithPadding,
-    PreTrainedTokenizerBase,
-    Trainer,
-    TrainerCallback,
-    TrainerControl,
-    is_wandb_available,
-    TrainerState,
-)
-from collections import defaultdict
+import gc
 import math
 import os
+import tempfile
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from multiprocessing import reduction
 from typing import Callable, Optional, Union
+from unittest.mock import patch
+
 import torch
-from accelerate import Accelerator
 from datasets import Dataset
 from torch.utils.data import DataLoader
-from transformers import (
-    DataCollatorWithPadding,
-    PreTrainedTokenizerBase,
-    Trainer,
-    TrainerCallback,
-    TrainerControl,
-    is_wandb_available,
-)
-import gc
-from open_r1.trainers.remote_model import RemoteModel
-import tempfile
-from trl.trainer.utils import pad, selective_log_softmax
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    DataCollatorWithPadding,
     GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
     Trainer,
     TrainerCallback,
+    TrainerControl,
+    TrainerState,
     is_wandb_available,
 )
-from trl.data_utils import maybe_apply_chat_template, is_conversational
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
-RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
-from vllm import LLM, SamplingParams
 
+import trl
+from accelerate import Accelerator
+from accelerate.utils import gather_object
+from open_r1.trainers.job_launcher import SGLangSlurmJobLauncher
+from open_r1.trainers.remote_model import RemoteModel
+from trl.data_utils import is_conversational, maybe_apply_chat_template
+from trl.trainer.utils import pad, selective_log_softmax
+
+
+RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+import contextlib
 import functools
 import time
 
 from transformers import is_wandb_available
 
+import wandb
+from vllm import LLM, SamplingParams
+
 
 if is_wandb_available():
     import wandb
 
-
-# def profiling_decorator(func):
-#     """
-#     Decorator to profile a function and log the time taken to execute it.
-#     """
-
-#     @functools.wraps(func)
-#     def wrapper(self, *args, **kwargs):
-#         start_time = time.perf_counter()
-#         result = func(self, *args, **kwargs)
-#         end_time = time.perf_counter()
-#         duration = end_time - start_time
-
-#         if "wandb" in self.args.report_to and wandb.run is not None and self.accelerator.is_main_process:
-#             wandb.log({f"profiling/Time taken: {self.__class__.__name__}.{func.__name__}": duration})
-#         return result
-
-#     return wrapper
-import time
-import contextlib
-import functools
-import wandb
 
 @contextlib.contextmanager
 def profiling_context(instance, name):
@@ -118,6 +83,7 @@ def profiling_context(instance, name):
     if "wandb" in instance.args.report_to and wandb.run is not None and instance.accelerator.is_main_process:
         wandb.log({f"profiling/Time taken: {instance.__class__.__name__}.{name}": duration})
 
+
 def profiling_decorator(func):
     """
     Decorator to profile a function and log execution time using profiling_context.
@@ -130,15 +96,20 @@ def profiling_decorator(func):
 
     return wrapper
 
+
 from accelerate import Accelerator
+
+
 if is_wandb_available():
     import wandb
+
 
 def exact_div(a, b, custom_error_message=""):
     q = a // b
     if a != q * b:
         raise ValueError(f"{custom_error_message}, inexact division: {a} / {b} = {a / b}")
     return q
+
 
 # TODO: add the shared options with a mixin to reduce code duplication
 @dataclass
@@ -170,27 +141,30 @@ class FastGRPOConfig(trl.GRPOConfig):
         metadata={"help": ("The project to store runs under.")},
     )
     remote_gen_model_url: str = field(
-        default="26.0.164.45", 
+        default="26.0.164.45",
     )
     remote_gen_model_port: str = field(
         default="30010",
+    )
+    remote_gen_model_n_gpus: str = field(
+        default=8,
     )
 
 
 class FastGRPOTrainer(Trainer):
     _tag_names = ["trl", "fast_grpo"]
-    def __init__(self, 
-                model: str, # only accept str for now
-                reward_funcs: Union[RewardFunc, list[RewardFunc]],
-                args: FastGRPOConfig, 
-                train_dataset: Dataset,
-                processing_class: Optional[PreTrainedTokenizerBase] = None,
-                data_collator: Optional[DataCollatorWithPadding] = None, 
-                callbacks: Optional[list[TrainerCallback]] = None,
-                optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
-                
-                ) -> None:
-        
+
+    def __init__(
+        self,
+        model: str,  # only accept str for now
+        reward_funcs: Union[RewardFunc, list[RewardFunc]],
+        args: FastGRPOConfig,
+        train_dataset: Dataset,
+        processing_class: Optional[PreTrainedTokenizerBase] = None,
+        data_collator: Optional[DataCollatorWithPadding] = None,
+        callbacks: Optional[list[TrainerCallback]] = None,
+        optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
+    ) -> None:
         self.args = args
         self.reward_funcs = reward_funcs
         # Reward weights (move this logic to post_init of config?)
@@ -202,9 +176,15 @@ class FastGRPOTrainer(Trainer):
                 )
             self.reward_weights = args.reward_weights
         else:
-            self.reward_weights = [1.0] * len(reward_funcs),
-        
-        
+            self.reward_weights = ([1.0] * len(reward_funcs),)
+
+        # start the remote model so it has time to warmup while we load the local model(s)
+        if self.args.remote_gen_model_url is None:
+            self.sglang_job_launcher = SGLangSlurmJobLauncher(
+                model, num_gpus=self.args.remote_gen_model_n_gpus, sglang_port=self.args.remote_gen_model_port
+            )
+            self.sglang_job_launcher.submit_job()
+
         # Trained model
         model_init_kwargs = args.model_init_kwargs or {}
         if isinstance(model, str):
@@ -227,40 +207,40 @@ class FastGRPOTrainer(Trainer):
             model = AutoModelForCausalLM.from_pretrained(model_str, **model_init_kwargs)
             # offload to cpu
             ref_model = AutoModelForCausalLM.from_pretrained(model_str, **model_init_kwargs).to("cpu")
-            
+
         self.model = model
         self.ref_model = ref_model
-        
 
         # Processing class
         if processing_class is None:
             processing_class = AutoTokenizer.from_pretrained(model.config._name_or_path, padding_side="left")
         self.processing_class = processing_class
-        
 
-        
         self.train_dataset = train_dataset
-        
+
         if data_collator is not None:
             raise ValueError("")
-        
+
         def data_collator(features):  # No data collation is needed in GRPO
-            return features       
+            return features
+
         self.data_collator = data_collator
-        
+
         local_dataloader_batch_size = exact_div(
-            args.per_device_train_batch_size * args.gradient_accumulation_steps, 
-            args.num_generations, "per_device_train_batch_size * gradient_accumulation_steps must >= num_generations to remain on policy"
+            args.per_device_train_batch_size * args.gradient_accumulation_steps,
+            args.num_generations,
+            "per_device_train_batch_size * gradient_accumulation_steps must >= num_generations to remain on policy",
         )
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
         self.accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
-        
-        
+
         self.train_dataset_len = len(self.train_dataset)
         num_total_samples = int(self.args.num_train_epochs * self.train_dataset_len)
-        self.total_steps_per_device = num_total_samples // (local_dataloader_batch_size * self.accelerator.num_processes)
-        self.create_optimizer_and_scheduler(num_training_steps=self.total_steps_per_device)     
+        self.total_steps_per_device = num_total_samples // (
+            local_dataloader_batch_size * self.accelerator.num_processes
+        )
+        self.create_optimizer_and_scheduler(num_training_steps=self.total_steps_per_device)
         #########
         ### trainer specifics
         #########
@@ -306,18 +286,25 @@ class FastGRPOTrainer(Trainer):
             drop_last=True,
         )
         torch.manual_seed(args.seed)
-        self.model, self.optimizer, self.dataloader = self.accelerator.prepare(self.model, self.optimizer, self.dataloader)
+        self.model, self.optimizer, self.dataloader = self.accelerator.prepare(
+            self.model, self.optimizer, self.dataloader
+        )
         device = self.accelerator.device
 
         # connect to a remote sglang model
-        self.remote_model = RemoteModel(args.remote_gen_model_url, args.remote_gen_model_port, self.processing_class.eos_token_id)
+        if self.args.remote_gen_model_url is None:
+            self.sglang_job_launcher.wait_for_server()
+            self.args.remote_gen_model_url = self.sglang_job_launcher.get_remote_ip()
+        self.remote_model = RemoteModel(
+            self.args.remote_gen_model_url, self.args.remote_gen_model_port, self.processing_class.eos_token_id
+        )
 
     def print_gpu_memory_usage(self):
         if torch.cuda.is_available():
             gpu_memory_allocated = torch.cuda.memory_allocated()
             gpu_memory_reserved = torch.cuda.memory_reserved()
-            print(f"GPU memory allocated: {gpu_memory_allocated / (1024 ** 3):.2f} GB")
-            print(f"GPU memory reserved: {gpu_memory_reserved / (1024 ** 3):.2f} GB")
+            print(f"GPU memory allocated: {gpu_memory_allocated / (1024**3):.2f} GB")
+            print(f"GPU memory reserved: {gpu_memory_reserved / (1024**3):.2f} GB")
         else:
             print("CUDA is not available.")
 
@@ -333,7 +320,7 @@ class FastGRPOTrainer(Trainer):
         # See https://github.com/huggingface/trl/issues/2770
         logits = logits[:, -logits_to_keep:]
         return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
-    
+
     @torch.no_grad()
     @profiling_decorator
     def _prepare_batch(self, batch):
@@ -346,59 +333,67 @@ class FastGRPOTrainer(Trainer):
         prompts = [x["prompt"] for x in batch]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in batch]
         prompt_inputs = self.processing_class(prompts_text)
-        
+
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
         # add cuda clear cache here and a sleep
 
+        all_outputs = self.remote_model.generate(
+            prompt_ids,
+            max_new_tokens=self.args.max_completion_length,
+            temperature=self.args.temperature,
+            num_generations=self.args.num_generations,
+        )
 
-        all_outputs = self.remote_model.generate(prompt_ids, max_new_tokens=self.args.max_completion_length, temperature=self.args.temperature, num_generations=self.args.num_generations)
-        
         # all_outputs = self.gen_vllm.generate(prompts_text, sampling_params=self.sampling_params, use_tqdm=True)
-        
+
         completion_ids = [example["completion_ids"] for example in all_outputs]
-        
-        
+
         # completion_ids = []
         # for outputs in all_outputs:
         #     for output in outputs.outputs:
         #         completion_ids.append(output.token_ids)
-               
+
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        
+
         repeated_prompts = []
         for prompt in prompts:
-            repeated_prompts.extend([prompt]*self.args.num_generations)
-        
+            repeated_prompts.extend([prompt] * self.args.num_generations)
+
         repeated_prompt_texts = []
         for prompt in prompts_text:
-            repeated_prompt_texts.extend([prompt]*self.args.num_generations)
-        
+            repeated_prompt_texts.extend([prompt] * self.args.num_generations)
+
         if is_conversational(batch[0]):
             completions = []
             for prompt, completion in zip(repeated_prompts, completions_text, strict=True):
                 bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
-            completions = completions_text        
-        
+            completions = completions_text
+
         rewards = torch.zeros(len(repeated_prompts), len(self.reward_funcs))
-        for i, reward_func,  in enumerate(self.reward_funcs):
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                keys = [key for key in batch[0] if key not in ["prompt", "completion"]]
-                reward_kwargs = defaultdict(list)
-                for example in batch:
-                    for key in keys:
-                        reward_kwargs[key].extend([example[key]]*self.args.num_generations)
-                output_reward_func = reward_func(prompts=repeated_prompts, completions=completions, **reward_kwargs)
-                rewards[:, i] = torch.tensor(output_reward_func, dtype=torch.float32) * self.reward_weights[i]
-        
+        for (
+            i,
+            reward_func,
+        ) in enumerate(self.reward_funcs):
+            # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+            keys = [key for key in batch[0] if key not in ["prompt", "completion"]]
+            reward_kwargs = defaultdict(list)
+            for example in batch:
+                for key in keys:
+                    reward_kwargs[key].extend([example[key]] * self.args.num_generations)
+            output_reward_func = reward_func(prompts=repeated_prompts, completions=completions, **reward_kwargs)
+            rewards[:, i] = torch.tensor(output_reward_func, dtype=torch.float32) * self.reward_weights[i]
+
         # calculate the advantages, the prompt is all on the same device to no need to gather here
         grouped_rewards = rewards.sum(-1).view(len(prompts), self.args.num_generations)
         EPS = 1e-4
-        grouped_advantages = (grouped_rewards - grouped_rewards.mean(-1, keepdim=True)) /  (grouped_rewards.std(-1, keepdim=True) + EPS)
+        grouped_advantages = (grouped_rewards - grouped_rewards.mean(-1, keepdim=True)) / (
+            grouped_rewards.std(-1, keepdim=True) + EPS
+        )
         advantages = grouped_advantages.flatten().tolist()
-        
+
         # build batch as list of dicts
         examples = []
         for i, prompt in enumerate(repeated_prompt_texts):
@@ -407,13 +402,13 @@ class FastGRPOTrainer(Trainer):
                 "prompt_ids": prompt_ids[i // self.args.num_generations],
                 "completion": completions_text[i],
                 "completion_ids": completion_ids[i],
-                "advantages": advantages[i], 
+                "advantages": advantages[i],
                 "rewards": rewards[i],
             }
             examples.append(example)
-        
-        return examples 
-    
+
+        return examples
+
     @profiling_decorator
     def _sync_weights(self):
         self.accelerator.wait_for_everyone()
@@ -425,73 +420,74 @@ class FastGRPOTrainer(Trainer):
                 self.remote_model.load_weights_from_path(temp_dir_path)
             print("weight sync took: ", time.time() - start)
         self.accelerator.wait_for_everyone()
-        
-    def train(self,         
-            resume_from_checkpoint: Optional[Union[str, bool]] = None,
-        ):
-        start_step = 1 # todo, set this when we resume + load model, opt state etc
-        
+
+    def train(
+        self,
+        resume_from_checkpoint: Optional[Union[str, bool]] = None,
+    ):
+        start_step = 1  # todo, set this when we resume + load model, opt state etc
+
         if self.args.logging_steps is not None:
             if self.args.logging_steps < 1:
                 self.state.logging_steps = math.ceil(self.state.max_steps * self.args.logging_steps)
             else:
                 self.state.logging_steps = self.args.logging_steps
-                
+
         if self.args.save_steps is not None:
             if self.args.save_steps < 1:
                 self.state.save_steps = math.ceil(self.state.max_steps * self.args.save_steps)
             else:
                 self.state.save_steps = self.args.save_steps
-                
+
         self.control = self.callback_handler.on_train_begin(self.args, self.state, self.control)
         self.state.global_step = 0
         self.state.max_steps = self.total_steps_per_device
         self.state.num_train_epochs = self.args.num_train_epochs
-        
+
         def repeat_generator():
             while True:
                 yield from self.dataloader
+
         iter_dataloader = iter(repeat_generator())
-        
+
         self.model.train()
-        
+
         @torch.no_grad()
         def mini_batch_collator(examples):
             device = self.accelerator.device
-            
+
             prompt_ids = [example["prompt_ids"] for example in examples]
             completion_ids = [example["completion_ids"] for example in examples]
-            
+
             if self.args.max_prompt_length is not None:
                 prompt_ids = [p[-self.args.max_prompt_length :] for p in prompt_ids]
-            
+
             pad_token_id = self.processing_class.pad_token_id
-            prompt_completion_ids = [torch.LongTensor(p+c) for p,c in zip(prompt_ids, completion_ids)]
+            prompt_completion_ids = [torch.LongTensor(p + c) for p, c in zip(prompt_ids, completion_ids)]
             prompt_completion_ids = pad(prompt_completion_ids, padding_value=pad_token_id)
             # attention_mask = (prompt_completion_ids != pad_token_id).long() # TODO, this does not work as expected when pad_id == eos_id
-        
-        
+
             # Mask everything after the first EOS token (taken from GRPOTrainer)
             is_eos = prompt_completion_ids == self.processing_class.eos_token_id
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1)
             attention_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
-        
-        
+
             advantages = torch.Tensor([example["advantages"] for example in examples])
-            
+
             return {
                 "prompt_completion_ids": prompt_completion_ids.to(device),
                 "attention_mask": attention_mask.to(device),
-                "advantages": advantages.to(device), 
+                "advantages": advantages.to(device),
             }
+
         device = self.accelerator.device
         for step in range(start_step, self.total_steps_per_device + 1):
             batch = next(iter_dataloader)
-            
+
             self.ref_model = self.ref_model.to("cpu")
-           
+
             batch = self._prepare_batch(batch)
 
             # TODO: log completions, rewards, etc
@@ -500,69 +496,81 @@ class FastGRPOTrainer(Trainer):
             mini_batch_dataloader = DataLoader(
                 gen_dataset,
                 batch_size=self.args.per_device_train_batch_size,
-                shuffle=True, # we technically don#t need to shuffle due to grad acc, but we may move to clipped loss later
+                shuffle=True,  # we technically don#t need to shuffle due to grad acc, but we may move to clipped loss later
                 drop_last=True,
-                collate_fn=mini_batch_collator
+                collate_fn=mini_batch_collator,
             )
             # optimization
             # stats for logging
             losses = []
             kls = []
-            
+
             with profiling_context(self, "train_step"):
-            # at this point there should be no tensors in GPU memory
+                # at this point there should be no tensors in GPU memory
                 for mini_batch in mini_batch_dataloader:
                     prompt_completion_ids = mini_batch["prompt_completion_ids"]
-                    attention_mask = mini_batch["attention_mask"][:, 1:] #  TODO, fix padding with the optimization from the original grpo trainer
-                    logits_to_keep = prompt_completion_ids.size(1) - 1 # TODO, fix padding with the optimization from the original grpo trainer
+                    attention_mask = mini_batch["attention_mask"][
+                        :, 1:
+                    ]  #  TODO, fix padding with the optimization from the original grpo trainer
+                    logits_to_keep = (
+                        prompt_completion_ids.size(1) - 1
+                    )  # TODO, fix padding with the optimization from the original grpo trainer
                     # torch.cuda.empty_cache()
-                    
+
                     # get the ref logprobs, this could also be done at the batch prepare step to avoid too much model unloading
                     self.ref_model = self.ref_model.to(device)
                     with torch.inference_mode():
                         ref_per_token_logps = self._get_per_token_logps(
                             self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-                        )   
+                        )
                     self.ref_model = self.ref_model.to("cpu")
                     # torch.cuda.empty_cache()
-                    
+
                     with self.accelerator.accumulate(self.model):
-                        per_token_logps = self._get_per_token_logps(self.model, prompt_completion_ids, attention_mask, logits_to_keep)
-                        per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
-                        
+                        per_token_logps = self._get_per_token_logps(
+                            self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                        )
+                        per_token_kl = (
+                            torch.exp(ref_per_token_logps - per_token_logps)
+                            - (ref_per_token_logps - per_token_logps)
+                            - 1
+                        )
+
                         advantages = mini_batch["advantages"]
-                        per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+                        per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(
+                            1
+                        )
                         per_token_loss = per_token_loss + self.args.beta * per_token_kl
                         loss = (per_token_loss * attention_mask).sum() / attention_mask.sum()
-                        
+
                         self.accelerator.backward(loss)
                         self.optimizer.step()
                         self.optimizer.zero_grad()
                         losses.append(loss.detach().item())
                         kls.append(per_token_kl.mean().item())
 
-            
                     del per_token_logps, per_token_kl, per_token_loss, loss
                     torch.cuda.empty_cache()
-                
-            
+
             self.lr_scheduler.step()
             self.state.global_step += 1
-            self.state.epoch = step / self.total_steps_per_device #  TODO, this is not correct
-                
+            self.state.epoch = step / self.total_steps_per_device  #  TODO, this is not correct
+
             # logging stats
             metrics = {}
             metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
             metrics["loss"] = self.accelerator.gather_for_metrics(torch.Tensor(losses).to(device)).mean().item()
             metrics["kl"] = self.accelerator.gather_for_metrics(torch.Tensor(kls).to(device)).mean().item()
-            
+
             # completions stats
             completion_lengths = [len(c) for c in gen_dataset["completion_ids"]]
-            gathered_completion_lengths = self.accelerator.gather_for_metrics(torch.Tensor(completion_lengths).to(device))
+            gathered_completion_lengths = self.accelerator.gather_for_metrics(
+                torch.Tensor(completion_lengths).to(device)
+            )
             metrics["mean_completion_lengths"] = gathered_completion_lengths.mean().item()
             metrics["max_completion_lengths"] = gathered_completion_lengths.max().item()
             metrics["min_completion_lengths"] = gathered_completion_lengths.min().item()
-            
+
             # reward stats
             rewards = gen_dataset["rewards"]
             gathered_rewards = self.accelerator.gather_for_metrics(torch.Tensor(rewards).to(device))
@@ -570,13 +578,13 @@ class FastGRPOTrainer(Trainer):
             for i, reward_func in enumerate(self.reward_funcs):
                 reward_func_name = reward_func.__name__
                 metrics[f"rewards/{reward_func_name}"] = reward_per_func[i].item()
-                
-            metrics["reward"] = reward_per_func.sum().item()    
-            
-                
+
+            metrics["reward"] = reward_per_func.sum().item()
+
             self.log(metrics)
             if self.args.log_completions and "wandb" in self.args.report_to:
                 import pandas as pd
+
                 prompts = gather_object(gen_dataset["prompt"])
                 completions = gather_object(gen_dataset["completion"])
                 # For logging
@@ -591,18 +599,15 @@ class FastGRPOTrainer(Trainer):
                 if wandb.run is not None and self.accelerator.is_main_process:
                     wandb.log({"completions": wandb.Table(dataframe=df)})
 
-            
             # sync weights to remote server
             self._sync_weights()
 
-            
             self.control = self.callback_handler.on_step_end(self.args, self.state, self.control)
             if self.control.should_save:
                 self._save_checkpoint(self.model, trial=None)
                 self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-                
+
         self.control = self.callback_handler.on_train_end(self.args, self.state, self.control)
         if self.control.should_save:
             self._save_checkpoint(self.model, trial=None, metrics=None)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-                

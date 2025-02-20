@@ -1,13 +1,21 @@
+import atexit
+import re
 import subprocess
 import time
-import re
-import atexit
+
 
 class SGLangSlurmJobLauncher:
-    def __init__(self, model_id_or_path, num_gpus=1, sglang_port=30010, slurm_script="slurm/launch_sglang.slurm", check_interval=5):
+    def __init__(
+        self,
+        model_id_or_path,
+        num_gpus=1,
+        sglang_port=30010,
+        slurm_script="slurm/launch_sglang.slurm",
+        check_interval=5,
+    ):
         """
         Initialize the job launcher.
-        
+
         :param slurm_script: Path to the SLURM script.
         :param check_interval: Time interval (seconds) to check job status.
         """
@@ -26,11 +34,17 @@ class SGLangSlurmJobLauncher:
         """Submits the SLURM job and extracts the job ID."""
         try:
             result = subprocess.run(
-                ["sbatch", f"--gres=gpu:{self.num_gpus}", self.slurm_script, self.model_id_or_path, str(self.sglang_port)],
+                [
+                    "sbatch",
+                    f"--gres=gpu:{self.num_gpus}",
+                    self.slurm_script,
+                    self.model_id_or_path,
+                    str(self.sglang_port),
+                ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                check=True
+                check=True,
             )
             match = re.search(r"Submitted batch job (\d+)", result.stdout)
             if match:
@@ -48,10 +62,7 @@ class SGLangSlurmJobLauncher:
             raise ValueError("Job ID is not set. Submit the job first.")
 
         result = subprocess.run(
-            ["squeue", "--job", self.job_id, "--noheader"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            ["squeue", "--job", self.job_id, "--noheader"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
 
         if not result.stdout.strip():
@@ -78,7 +89,7 @@ class SGLangSlurmJobLauncher:
             ["squeue", "--job", self.job_id, "--noheader", "--format=%N"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
         )
 
         if result.stdout.strip():
@@ -92,10 +103,7 @@ class SGLangSlurmJobLauncher:
             raise ValueError("Node name is not set. Wait for the job to start first.")
 
         result = subprocess.run(
-            ["scontrol", "show", "node", self.node_name],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
+            ["scontrol", "show", "node", self.node_name], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
         )
 
         match = re.search(r"NodeAddr=(\S+)", result.stdout)
@@ -119,20 +127,21 @@ class SGLangSlurmJobLauncher:
             print(f"Cleaning up: Cancelling job {self.job_id}...")
             subprocess.run(["scancel", self.job_id], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             print("Job cancelled.")
-            
+
     def __del__(self):
         """Ensure job cleanup when the instance is destroyed."""
-        self.cleanup()             
+        self.cleanup()
 
 
 if __name__ == "__main__":
     from open_r1.trainers.remote_model import RemoteModel
+
     launcher = SGLangSlurmJobLauncher("HuggingFaceTB/SmolLM2-135M-Instruct")
     ip_address = launcher.launch()
     launcher.ip_address
     time.sleep(15)
     remote_model = RemoteModel(f"{ip_address}", 30010)
     remote_model.wait_for_server()
-    
+
     result = remote_model.generate([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
     print(result)
