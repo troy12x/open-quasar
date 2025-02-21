@@ -475,29 +475,34 @@ class FastGRPOTrainer(Trainer):
         def mini_batch_collator(examples):
             device = self.accelerator.device
 
-            prompt_ids = [example["prompt_ids"] for example in examples]
-            completion_ids = [example["completion_ids"] for example in examples]
-
-            if self.args.max_prompt_length is not None:
-                prompt_ids = [p[-self.args.max_prompt_length :] for p in prompt_ids]
+            prompt_ids = [torch.LongTensor(example["prompt_ids"]) for example in examples]
+            completion_ids = [torch.LongTensor(example["completion_ids"]) for example in examples]
 
             pad_token_id = self.processing_class.pad_token_id
-            prompt_completion_ids = [torch.LongTensor(p + c) for p, c in zip(prompt_ids, completion_ids)]
-            prompt_completion_ids = pad(prompt_completion_ids, padding_value=pad_token_id)
-            # attention_mask = (prompt_completion_ids != pad_token_id).long() # TODO, this does not work as expected when pad_id == eos_id
+            
+            padded_prompt_ids = pad(prompt_ids, padding_value=pad_token_id, padding_side="left")
+            padded_completion_ids = pad(completion_ids, padding_value=pad_token_id, padding_side="right")
+            
+            if self.args.max_prompt_length is not None:
+                padded_prompt_ids = padded_prompt_ids[:, -self.args.max_prompt_length :]
 
-            # Mask everything after the first EOS token (taken from GRPOTrainer)
-            is_eos = prompt_completion_ids == self.processing_class.eos_token_id
+            # compute the masks
+            prompt_mask = (padded_prompt_ids != pad_token_id).long()
+
+            # Mask everything after the first EOS token
+            is_eos = padded_completion_ids == self.processing_class.eos_token_id
             eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
             eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
             sequence_indices = torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1)
-            attention_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+            completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
             advantages = torch.Tensor([example["advantages"] for example in examples])
 
             return {
-                "prompt_completion_ids": prompt_completion_ids.to(device),
-                "attention_mask": attention_mask.to(device),
+                "prompt_ids": padded_prompt_ids.to(device),
+                "prompt_mask": prompt_mask.to(device),
+                "completion_ids": padded_completion_ids.to(device),
+                "completion_mask": completion_mask.to(device),
                 "advantages": advantages.to(device),
             }
 
@@ -523,23 +528,20 @@ class FastGRPOTrainer(Trainer):
 
             with profiling_context(self, "train_step"):
                 for mini_batch in mini_batch_dataloader:
-                    prompt_completion_ids = mini_batch["prompt_completion_ids"]
-                    attention_mask = mini_batch["attention_mask"][
-                        :, 1:
-                    ]  #  TODO, fix padding with the optimization from the original grpo trainer
-                    logits_to_keep = (
-                        prompt_completion_ids.size(1) - 1
-                    )  # TODO, fix padding with the optimization from the original grpo trainer
-                    # get the ref logprobs, this could also be done at the batch prepare step to avoid too much model unloading
-                    # self.ref_model = self.ref_model.to(device)
+                    prompt_ids, prompt_mask = mini_batch["prompt_ids"], mini_batch["prompt_mask"]
+                    completion_ids, completion_mask = mini_batch["completion_ids"], mini_batch["completion_mask"]
+                    input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+                    attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
+                    logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+                    
                     with torch.inference_mode():
                         ref_per_token_logps = self._get_per_token_logps(
-                            self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                            self.ref_model, input_ids, attention_mask, logits_to_keep
                         )
 
                     with self.accelerator.accumulate(self.model):
                         per_token_logps = self._get_per_token_logps(
-                            self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                            self.model, input_ids, attention_mask, logits_to_keep
                         )
                         per_token_kl = (
                             torch.exp(ref_per_token_logps - per_token_logps)
@@ -548,11 +550,12 @@ class FastGRPOTrainer(Trainer):
                         )
 
                         advantages = mini_batch["advantages"]
+                        # TODO: convert to clipped loss so we can multiple GRPO epochs
                         per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(
                             1
                         )
                         per_token_loss = per_token_loss + self.args.beta * per_token_kl
-                        loss = (per_token_loss * attention_mask).sum() / attention_mask.sum()
+                        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
 
                         self.accelerator.backward(loss)
                         self.optimizer.step()
@@ -561,6 +564,9 @@ class FastGRPOTrainer(Trainer):
                         kls.append(per_token_kl.mean().item())
 
                     del per_token_logps, per_token_kl, per_token_loss, loss
+                    
+                    # force garbage collection and empty cache
+                    gc.collect()
                     torch.cuda.empty_cache()
 
             self.lr_scheduler.step()
