@@ -145,7 +145,7 @@ class RemoteGRPOConfig(trl.GRPOConfig):
         metadata={"help": ("The project to store runs under.")},
     )
     remote_gen_model_url: str = field(
-        default="0.0.0.0",
+        default="26.0.164.45",
     )
     remote_gen_model_port: str = field(
         default="30010",
@@ -279,7 +279,6 @@ class RemoteGRPOTrainer(Trainer):
             num_generations=self.args.num_generations,
             replacement=False,
         )
-
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         if len(self.batch_buffer) > 0:
             return self.batch_buffer.pop(0)
@@ -289,14 +288,15 @@ class RemoteGRPOTrainer(Trainer):
         prompt_inputs = self.processing_class(prompts_text)
 
         prompt_ids = prompt_inputs["input_ids"]
-
-
-        all_outputs = self.remote_model.generate(
-            prompt_ids,
-            max_new_tokens=self.args.max_completion_length,
-            temperature=self.args.temperature,
-            num_generations=self.args.num_generations,
-        )
+        # sync weights here?
+        self._sync_weights()
+        with profiling_context(self, "remote_generate"):
+            all_outputs = self.remote_model.generate(
+                prompt_ids,
+                max_new_tokens=self.args.max_completion_length,
+                temperature=self.args.temperature,
+                num_generations=self.args.num_generations,
+            )
         completion_ids = [example["completion_ids"] for example in all_outputs]
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
@@ -349,6 +349,47 @@ class RemoteGRPOTrainer(Trainer):
 
         gen_dataset = Dataset.from_list(examples)
         
+        # logging to wandb
+        device = self.accelerator.device
+        metrics = {}
+        completion_lengths = [len(c) for c in gen_dataset["completion_ids"]]
+        gathered_completion_lengths = self.accelerator.gather_for_metrics(
+            torch.Tensor(completion_lengths).to(device)
+        )
+        metrics["mean_completion_lengths"] = gathered_completion_lengths.mean().item()
+        metrics["max_completion_lengths"] = gathered_completion_lengths.max().item()
+        metrics["min_completion_lengths"] = gathered_completion_lengths.min().item()
+
+        # reward stats
+        rewards = gen_dataset["rewards"]
+        gathered_rewards = self.accelerator.gather_for_metrics(torch.Tensor(rewards).to(device))
+        reward_per_func = gathered_rewards.mean(0)
+        for i, reward_func in enumerate(self.reward_funcs):
+            reward_func_name = reward_func.__name__
+            metrics[f"rewards/{reward_func_name}"] = reward_per_func[i].item()
+        
+        metrics["reward"] = reward_per_func.sum().item()
+
+        self.log(metrics)
+        
+        if self.args.log_completions and "wandb" in self.args.report_to:
+            import pandas as pd
+
+            prompts = gather_object(gen_dataset["prompt"])
+            completions = gather_object(gen_dataset["completion"])
+            # For logging
+            table = {
+                "step": [str(self.state.global_step)] * len(prompts),
+                "prompts": prompts,
+                "completion": completions,
+                "reward": gathered_rewards.sum(1).tolist(),
+            }
+            df = pd.DataFrame(table)
+
+            if wandb.run is not None and self.accelerator.is_main_process:
+                wandb.log({"completions": wandb.Table(dataframe=df)})
+        
+        
         def mini_batch_collator(mini_batch):
             return mini_batch
         
@@ -364,6 +405,19 @@ class RemoteGRPOTrainer(Trainer):
             self.batch_buffer.append(mini_batch)
         
         return self.batch_buffer.pop(0)
+    
+    @profiling_decorator
+    def _sync_weights(self):
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            start = time.time()
+            # would be better is this was a ram disk + separate thread for writing
+            with tempfile.TemporaryDirectory(dir="/fsx/edward/work/open-r1/data/") as temp_dir_path:
+                unwrapped_model = self.accelerator.unwrap_model(self.model)
+                unwrapped_model.save_pretrained(temp_dir_path)
+                self.remote_model.load_weights_from_path(temp_dir_path)
+            print("weight sync took: ", time.time() - start)
+        self.accelerator.wait_for_everyone()
         
     # Get the per-token log probabilities for the completions for the model and the reference model
     @profiling_decorator
