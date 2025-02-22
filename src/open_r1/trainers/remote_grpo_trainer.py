@@ -5,6 +5,9 @@ import math
 import os
 import tempfile
 import time
+from torch.utils.data import RandomSampler
+from typing import Iterator
+
 from collections import defaultdict
 from dataclasses import dataclass, field
 from multiprocessing import reduction
@@ -28,6 +31,8 @@ from transformers import (
     TrainerState,
     is_wandb_available,
 )
+from torch.utils.data import Sampler
+from typing import Any
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
@@ -47,7 +52,7 @@ if is_liger_kernel_available():
     from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
-
+from typing import Optional, Iterator, Sized
 
 if is_wandb_available():
     import wandb
@@ -84,6 +89,31 @@ def profiling_decorator(func):
 
     return wrapper
 # TODO: add the shared options with a mixin to reduce code duplication
+
+
+class RepeatBatchRandomSampler(RandomSampler):
+    def __init__(self, 
+                 *args,
+                num_generations: int = 1, 
+                batch_size: int = 3,  
+                 **kwargs,
+                 )-> None:
+        self.num_generations = num_generations
+        self.batch_size = batch_size
+        super().__init__(*args, **kwargs)
+    
+    def __len__(self) -> int:
+        return super().__len__() * self.num_generations
+
+    def __iter__(self) -> Iterator[int]:
+        batch_indices = []
+        for idx in super().__iter__():
+            batch_indices.append(idx)
+            if len(batch_indices) == self.batch_size:
+                batch_indices = batch_indices * self.num_generations
+                yield from batch_indices
+                batch_indices = []
+
 @dataclass
 class RemoteGRPOConfig(trl.GRPOConfig):
     """
@@ -163,6 +193,8 @@ class RemoteGRPOTrainer(Trainer):
             
         def data_collator(features):  # No data collation is needed in GRPO
             return features
+        
+        self.batch_buffer = []
             
         super().__init__(model, args, train_dataset=train_dataset, processing_class=processing_class, callbacks=callbacks, data_collator=data_collator)
         
@@ -232,6 +264,171 @@ class RemoteGRPOTrainer(Trainer):
             model = AutoModelForCausalLM.from_pretrained(model_path, **model_init_kwargs)
         return model
     
+    def _get_train_sampler(self) -> Sampler:
+        """
+        Return the train sampler.
+
+        Returns:
+            Sampler: The train sampler.
+        """
+        if self.args.dataloader_num_workers != 0:
+            raise ValueError("dataloader_num_workers should not be greater than 0 for remote training")
+        return RepeatBatchRandomSampler(
+            data_source=self.train_dataset,
+            batch_size=self._train_batch_size,
+            num_generations=self.args.num_generations,
+            replacement=False,
+        )
+
+    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+        if len(self.batch_buffer) > 0:
+            return self.batch_buffer.pop(0)
+        
+        prompts = [x["prompt"] for x in inputs]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        prompt_inputs = self.processing_class(prompts_text)
+
+        prompt_ids = prompt_inputs["input_ids"]
+
+
+        all_outputs = self.remote_model.generate(
+            prompt_ids,
+            max_new_tokens=self.args.max_completion_length,
+            temperature=self.args.temperature,
+            num_generations=self.args.num_generations,
+        )
+        completion_ids = [example["completion_ids"] for example in all_outputs]
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+
+        repeated_prompts = []
+        for prompt in prompts:
+            repeated_prompts.extend([prompt] * self.args.num_generations)
+
+        repeated_prompt_texts = []
+        for prompt in prompts_text:
+            repeated_prompt_texts.extend([prompt] * self.args.num_generations)
+
+        if is_conversational(inputs[0]):
+            completions = []
+            for prompt, completion in zip(repeated_prompts, completions_text, strict=True):
+                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+        else:
+            completions = completions_text
+
+        rewards = torch.zeros(len(repeated_prompts), len(self.reward_funcs))
+        for i, reward_func in enumerate(self.reward_funcs):
+            # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+            keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+            reward_kwargs = defaultdict(list)
+            for example in inputs:
+                for key in keys:
+                    reward_kwargs[key].extend([example[key]] * self.args.num_generations)
+            output_reward_func = reward_func(prompts=repeated_prompts, completions=completions, **reward_kwargs)
+            rewards[:, i] = torch.tensor(output_reward_func, dtype=torch.float32) * self.reward_weights[i]
+
+        # calculate the advantages, the prompt is all on the same device to no need to gather here
+        grouped_rewards = rewards.sum(-1).view(len(prompts), self.args.num_generations)
+        EPS = 1e-4
+        grouped_advantages = (grouped_rewards - grouped_rewards.mean(-1, keepdim=True)) / (
+            grouped_rewards.std(-1, keepdim=True) + EPS
+        )
+        advantages = grouped_advantages.flatten().tolist()
+
+        examples = []
+        for i, prompt in enumerate(repeated_prompt_texts):
+            example = {
+                "prompt": prompt,
+                "prompt_ids": prompt_ids[i // self.args.num_generations],
+                "completion": completions_text[i],
+                "completion_ids": completion_ids[i],
+                "advantages": advantages[i],
+                "rewards": rewards[i],
+            }
+            examples.append(example)
+
+        gen_dataset = Dataset.from_list(examples)
+        
+        def mini_batch_collator(mini_batch):
+            return mini_batch
+        
+        mini_batch_dataloader = DataLoader(
+            gen_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            shuffle=True,  # we technically don#t need to shuffle due to grad acc, but we may move to clipped loss later
+            drop_last=True,
+            collate_fn=mini_batch_collator,
+        )
+        
+        for mini_batch in mini_batch_dataloader:
+            self.batch_buffer.append(mini_batch)
+        
+        return self.batch_buffer.pop(0)
+        
+    # Get the per-token log probabilities for the completions for the model and the reference model
+    @profiling_decorator
+    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep):
+        # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
+        logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+
+        input_ids = input_ids[:, -logits_to_keep:]
+        # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
+        # See https://github.com/huggingface/trl/issues/2770
+        logits = logits[:, -logits_to_keep:]
+        return selective_log_softmax(logits, input_ids)  #  compute logprobs for the input tokens
+    
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        print("compute_loss")
-        pass
+        device = self.accelerator.device
+        prompt_ids = [torch.LongTensor(example["prompt_ids"]) for example in inputs]
+        completion_ids = [torch.LongTensor(example["completion_ids"]) for example in inputs]
+        # ref_per_token_logps = [torch.Tensor(example["ref_per_token_logps"]) for example in inputs]
+        
+        # for logps, completion_id in zip(ref_per_token_logps, completion_ids):
+        #     assert len(logps) == len(completion_id), f"len(logps)={len(logps)} != len(completion_id)={len(completion_id)}"
+        
+        pad_token_id = self.processing_class.pad_token_id
+        
+        prompt_ids = pad(prompt_ids, padding_value=pad_token_id, padding_side="left")
+        completion_ids = pad(completion_ids, padding_value=pad_token_id, padding_side="right")
+        # padd_ref_per_token_logps = pad(ref_per_token_logps, padding_value=0.0, padding_side="right")
+        
+        if self.args.max_prompt_length is not None:
+            prompt_ids = prompt_ids[:, -self.args.max_prompt_length :]
+
+        # compute the masks
+        prompt_mask = (prompt_ids != pad_token_id).long()
+
+        # Mask everything after the first EOS token
+        is_eos = completion_ids == self.processing_class.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1)).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+        advs = torch.Tensor([example["advantages"] for example in inputs])    
+        
+        
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1).to(device)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1).to(device)
+        completion_mask =completion_mask.to(device)
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        
+        # ref_per_token_logps = inputs["ref_per_token_logps"]
+
+        per_token_logps = self._get_per_token_logps(
+            model, input_ids, attention_mask, logits_to_keep
+        )
+        # TODO: add the reference model
+        # per_token_kl = (
+        #     torch.exp(ref_per_token_logps - per_token_logps)
+        #     - (ref_per_token_logps - per_token_logps)
+        #     - 1
+        # )
+        advs = torch.Tensor([example["advantages"] for example in inputs]).to(device)
+        # TODO: convert to clipped loss so we can multiple GRPO epochs
+        per_token_loss = -torch.exp(per_token_logps - per_token_logps.detach()) * advs.unsqueeze(1)
+        # per_token_loss = per_token_loss + self.args.beta * per_token_kl
+        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+        
+        return loss
